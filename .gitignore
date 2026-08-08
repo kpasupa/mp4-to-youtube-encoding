@@ -1,0 +1,20 @@
+# OAuth client config + cached credentials - never commit
+client_secrets.json
+client_secret*.json
+token.json
+
+# resumable run state
+.yt_roundtrip_state.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# media
+*.mp4
+*.mkv
+*.webm
+*.part
+*.ytdl
