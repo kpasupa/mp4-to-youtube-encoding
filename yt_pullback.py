@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import sys
+import time
 import unicodedata
 from pathlib import Path
 
@@ -32,22 +33,50 @@ from googleapiclient.errors import HttpError
 
 from yt_roundtrip import (
     State,
-    available_heights,
     base_opts,
     download,
     get_service,
     probe_height,
     target_rung,
-    wait_for_rung,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.1.2"
 
 STATE_NAME = ".yt_pullback_state.json"
 # YouTube Data API v3 costs.
 COST_LIST = 1
 COST_UPDATE = 50
 COST_DELETE = 50
+
+
+# yt-dlp reports codecs as e.g. 'vp9', 'av01.0.08M', 'avc1.640028'.
+CODEC_PREFIX = {"av1": "av01", "vp9": "vp9", "h264": "avc1"}
+
+
+def probe_renditions(url: str, opts: dict) -> list[tuple[int, str]]:
+    """(height, codec) for every video rendition YouTube currently serves."""
+    try:
+        with yt_dlp.YoutubeDL({**opts, "skip_download": True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except yt_dlp.utils.DownloadError:
+        return []
+    return [(f["height"], (f.get("vcodec") or "").split(".")[0])
+            for f in info.get("formats", [])
+            if f.get("vcodec") not in (None, "none") and f.get("height")]
+
+
+def readiness(url: str, rung: int, codec: str, opts: dict) -> tuple[int, bool]:
+    """Best height available, and whether the wanted codec exists at `rung`.
+
+    YouTube publishes H.264 within minutes but VP9/AV1 only later, so treating
+    'the resolution exists' as ready hands you the largest rendition on offer.
+    """
+    rends = probe_renditions(url, opts)
+    best = max([h for h, _ in rends] or [0])
+    if codec == "any":
+        return best, best >= rung
+    prefix = CODEC_PREFIX[codec]
+    return best, any(h >= rung and vc.startswith(prefix) for h, vc in rends)
 
 
 class Quota:
@@ -168,7 +197,12 @@ def parse_args(argv=None):
     p.add_argument("--since", default="2026-07-21",
                    help="ignore videos published before this date (YYYY-MM-DD)")
     p.add_argument("--ext", default=".mp4", help="comma-separated source extensions")
-    p.add_argument("--codec", choices=["any", "av1", "vp9", "h264"], default="any")
+    p.add_argument("--codec", choices=["any", "av1", "vp9", "h264"], default="vp9",
+                   help="wait for this codec at source resolution before "
+                        "downloading; 'any' takes the first rendition, which is "
+                        "H.264 and roughly twice the size")
+    p.add_argument("--codec-wait", type=int, default=21600,
+                   help="seconds to wait for --codec before settling for H.264")
     p.add_argument("--keep-remote", action="store_true",
                    help="don't delete videos from YouTube after downloading")
     p.add_argument("--keep-private", action="store_true",
@@ -256,82 +290,119 @@ def main(argv=None) -> int:
         print(f"\nquota used: {quota.spent}/{args.quota_budget} (listing only)")
         return 0
 
-    done = failed = skipped = 0
-    for n, (v, rel) in enumerate(matched, 1):
+    # ---- prepare the work list: unlist everything, probe every source ----- #
+    done = failed = 0
+    pending = []
+    for v, rel in matched:
         key = rel.as_posix()
         e = state.entry(key)
         dest = args.output / rel
-        src = args.source / rel
 
         if e.get("status") == "done" and dest.exists():
             done += 1
             continue
-
-        print(f"\n[{n}/{len(matched)}] {key}")
         e["video_id"] = v["id"]
 
         if not args.keep_private and v["status"]["privacyStatus"] == "private":
             if not set_unlisted(service, v, quota):
-                print("    quota exhausted - rerun tomorrow")
-                break
-            print("    set to unlisted")
+                print(f"quota exhausted while unlisting - {key} left for next run")
+                continue
+            print(f"unlisted  {key}")
 
         try:
-            rung = target_rung(probe_height(src))
+            rung = target_rung(probe_height(args.source / rel))
         except Exception as exc:
-            print(f"    ffprobe failed, skipping: {exc}")
+            print(f"ffprobe failed, skipping {key}: {exc}")
             e.update(status="failed", error=str(exc))
             failed += 1
-            state.save()
             continue
         e["target_rung"] = rung
+        pending.append({"v": v, "rel": rel, "dest": dest, "rung": rung,
+                        "url": f"https://www.youtube.com/watch?v={v['id']}"})
+    state.save()
 
-        url = f"https://www.youtube.com/watch?v={v['id']}"
-        best = wait_for_rung(url, rung, opts, args.wait_timeout, args.poll_interval)
-        if best is None:
-            print(f"    still transcoding, no {rung}p yet - rerun later")
-            skipped += 1
-            continue
+    # ---- take whatever is ready, cycle, don't let one slow transcode block --- #
+    print(f"\n{len(pending)} to fetch; waiting for a {args.codec} rendition "
+          f"at source resolution\n")
+    start = time.time()
+    settled_warned = False
+    # Never give up before the codec deadline, or the two flags fight.
+    deadline = start + max(args.wait_timeout, args.codec_wait)
+    while pending:
+        # Past the codec deadline, take H.264 rather than lose the upload.
+        settle = time.time() > start + args.codec_wait
+        want = "any" if settle else args.codec
+        if settle and not settled_warned:
+            print(f"  waited {args.codec_wait}s for {args.codec}; "
+                  f"accepting whatever is available now")
+            settled_warned = True
 
-        try:
-            download(url, rung, dest, args.codec, opts)
-        except yt_dlp.utils.DownloadError as exc:
-            print(f"    download failed: {exc}")
-            e.update(status="failed", error=str(exc))
-            failed += 1
-            state.save()
-            continue
+        ready = []
+        for job in list(pending):
+            best, is_ready = readiness(job["url"], job["rung"], want, opts)
+            job["best"] = best
+            job["codec"] = want
+            if is_ready:
+                ready.append(job)
 
-        if not dest.exists() or dest.stat().st_size == 0:
-            print("    download produced no file - leaving the video up")
-            e.update(status="failed", error="empty output")
-            failed += 1
-            state.save()
-            continue
+        for job in ready:
+            pending.remove(job)
+            rel, dest, rung = job["rel"], job["dest"], job["rung"]
+            key = rel.as_posix()
+            e = state.entry(key)
+            print(f"[{done + failed + 1}/{len(matched)}] {key}")
 
-        got = min(best, rung)
-        e.update(status="done", downloaded_height=got, size=dest.stat().st_size)
-        print(f"    saved {dest.stat().st_size / 1e6:.1f} MB at {got}p")
-        done += 1
-
-        # Only ever delete once the file is verifiably on disk.
-        if not args.keep_remote:
-            if not quota.can(COST_DELETE):
-                print("    quota exhausted - video left on YouTube, rerun to clean up")
-                e["pending_delete"] = True
-                state.save()
-                break
             try:
-                service.videos().delete(id=v["id"]).execute()
-                quota.charge(COST_DELETE)
-                e["deleted"] = True
-                print("    deleted from YouTube")
-            except HttpError as exc:
-                print(f"    could not delete: {exc}")
-        state.save()
+                download(job["url"], rung, dest, job["codec"], opts)
+            except yt_dlp.utils.DownloadError as exc:
+                print(f"    download failed: {exc}")
+                e.update(status="failed", error=str(exc))
+                failed += 1
+                state.save()
+                continue
+
+            if not dest.exists() or dest.stat().st_size == 0:
+                print("    download produced no file - leaving the video up")
+                e.update(status="failed", error="empty output")
+                failed += 1
+                state.save()
+                continue
+
+            got = min(job["best"], rung)
+            e.update(status="done", downloaded_height=got, size=dest.stat().st_size)
+            print(f"    saved {dest.stat().st_size / 1e6:.1f} MB at {got}p")
+            done += 1
+
+            # Only ever delete once the file is verifiably on disk.
+            if not args.keep_remote:
+                if not quota.can(COST_DELETE):
+                    print("    quota exhausted - left on YouTube, rerun to clean up")
+                    e["pending_delete"] = True
+                elif not args.dry_run:
+                    try:
+                        service.videos().delete(id=job["v"]["id"]).execute()
+                        quota.charge(COST_DELETE)
+                        e["deleted"] = True
+                        print("    deleted from YouTube")
+                    except HttpError as exc:
+                        print(f"    could not delete: {exc}")
+            state.save()
+
+        if not pending:
+            break
+        if time.time() > deadline:
+            print(f"\nstill transcoding after {args.wait_timeout}s, left for a rerun:")
+            for job in pending:
+                print(f"     {job['best']}p / need {job['rung']}p  {job['rel']}")
+            break
+        if not ready:
+            waiting = ", ".join(f"{j['best']}p/{j['rung']}p" for j in pending[:6])
+            print(f"  {len(pending)} awaiting {want} ({waiting}) - "
+                  f"checking again in {args.poll_interval}s")
+            time.sleep(args.poll_interval)
 
     state.save()
-    print(f"\ndone: {done}   failed: {failed}   still processing: {skipped}")
+    print(f"\ndone: {done}   failed: {failed}   still processing: {len(pending)}")
     print(f"quota used: {quota.spent}/{args.quota_budget}")
     return 1 if failed else 0
 
