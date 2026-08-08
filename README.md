@@ -53,8 +53,8 @@ Use this project when you specifically want *YouTube's* encoding ladder.
 ### Install
 
 ```bash
-git clone https://github.com/<you>/yt-roundtrip.git
-cd yt-roundtrip
+git clone https://github.com/kpasupa/mp4-to-youtube-encoding.git
+cd mp4-to-youtube-encoding
 pip install -r requirements.txt
 ```
 
