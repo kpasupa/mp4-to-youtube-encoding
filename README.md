@@ -145,7 +145,84 @@ re-authenticate whenever it expires.
 
 ---
 
-## Usage
+## Two ways to run this
+
+**`yt_pullback.py` — drag-and-drop (recommended for large libraries).** You upload
+through the YouTube Studio web UI yourself, then this script pulls everything back down
+and rebuilds the folder tree. Browser uploads are not subject to the API upload quota, so
+the 6-per-day ceiling disappears entirely.
+
+**`yt_roundtrip.py` — fully automated.** Uploads via the API too, so nothing is manual —
+but you are capped at roughly 6 videos per day.
+
+Both need the same OAuth setup, and both preserve your folder structure and file names.
+
+---
+
+## Usage — drag-and-drop (`yt_pullback.py`)
+
+**1. Upload.** In [YouTube Studio](https://studio.youtube.com/) → **Create → Upload
+videos**, drag your folders in. YouTube flattens them — that's fine, the script puts the
+structure back. Set visibility to **Unlisted** during upload if you can; it saves 50 quota
+units per video versus letting the script flip them later.
+
+**2. Pull them back.**
+
+```bash
+python yt_pullback.py "E:\source folder" "E:\output folder" --since 2026-07-21 --dry-run
+```
+
+`--since` is the safety catch: videos published before that date are ignored completely, so
+the script can never touch pre-existing content on your channel. Set it to the day you
+started uploading.
+
+`--dry-run` prints the full match table and exits without changing anything. Check it, then
+drop the flag to run for real.
+
+### How matching works
+
+YouTube uses the filename as the title but rewrites punctuation —
+`1.การอ่าน Block diagram.mp4` becomes the title `1 การอ่าน Block diagram`. The script folds
+both sides to a comparable key (punctuation → spaces, case-flattened, Unicode NFC, and
+combining marks such as Thai tone marks preserved) and matches on that.
+
+Anything it cannot resolve is reported, never guessed:
+
+- **name collisions** — two source files whose names normalise identically are skipped,
+  since there is no safe way to know which folder a video belongs in
+- **unmatched videos** — on YouTube but with no local counterpart; left completely alone
+- **missing files** — local files with no video yet, i.e. still uploading
+
+### What it does per video
+
+Flips Private → Unlisted if needed → waits until YouTube serves a rendition at the source
+resolution → downloads to `OUTPUT/<original relative path>` → **verifies the file exists and
+is non-empty** → only then deletes it from YouTube.
+
+### Quota
+
+Listing is ~1 unit per 50 videos, but `videos.update` and `videos.delete` cost **50 units
+each**. With a 10,000/day budget that's about 100 videos per run if the script has to both
+unlist and delete, or ~200 if you set visibility during upload. It tracks its own spend and
+stops cleanly at `--quota-budget`; rerun the next day to continue.
+
+### Options
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--since` | `2026-07-21` | Ignore anything published before this date |
+| `--keep-remote` | off | Don't delete from YouTube after downloading |
+| `--keep-private` | off | Don't flip Private → Unlisted (then you need `--cookies*`) |
+| `--quota-budget` | `10000` | Stop before exceeding this many API units |
+| `--codec` | `any` | `av1`, `vp9`, `h264` |
+| `--dry-run` | off | Print the match table and exit |
+
+Plus `--ext`, `--client-secrets`, `--token`, `--cookies`, `--cookies-from-browser`,
+`--wait-timeout`, `--poll-interval`, same as below.
+
+---
+
+## Usage — fully automated (`yt_roundtrip.py`)
 
 ```bash
 python yt_roundtrip.py SOURCE OUTPUT [options]
