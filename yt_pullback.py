@@ -40,7 +40,7 @@ from yt_roundtrip import (
     target_rung,
 )
 
-__version__ = "1.1.3"
+__version__ = "1.1.5"
 
 STATE_NAME = ".yt_pullback_state.json"
 # YouTube Data API v3 costs.
@@ -196,13 +196,18 @@ def parse_args(argv=None):
     p.add_argument("output", type=Path, help="where to rebuild the tree")
     p.add_argument("--since", default="2026-07-21",
                    help="ignore videos published before this date (YYYY-MM-DD)")
-    p.add_argument("--ext", default=".mp4", help="comma-separated source extensions")
+    p.add_argument("--ext", default=".mp4,.wmv,.mov,.avi,.mkv",
+                   help="comma-separated source extensions to look for")
     p.add_argument("--codec", choices=["any", "av1", "vp9", "h264"], default="any",
                    help="'any' downloads as soon as the source resolution is "
                         "available; naming a codec waits for that codec too, "
                         "which yields smaller files but can take hours")
     p.add_argument("--codec-wait", type=int, default=21600,
                    help="seconds to wait for --codec before settling for H.264")
+    p.add_argument("--download-retries", type=int, default=3,
+                   help="attempts per video when YouTube returns 403")
+    p.add_argument("--pause", type=int, default=10,
+                   help="seconds between downloads, to avoid rate limiting")
     p.add_argument("--keep-remote", action="store_true",
                    help="don't delete videos from YouTube after downloading")
     p.add_argument("--keep-private", action="store_true",
@@ -296,7 +301,8 @@ def main(argv=None) -> int:
     for v, rel in matched:
         key = rel.as_posix()
         e = state.entry(key)
-        dest = args.output / rel
+        # YouTube always hands back mp4, whatever the source container was.
+        dest = (args.output / rel).with_suffix(".mp4")
 
         if e.get("status") == "done" and dest.exists():
             done += 1
@@ -353,10 +359,22 @@ def main(argv=None) -> int:
             e = state.entry(key)
             print(f"[{done + failed + 1}/{len(matched)}] {key}")
 
-            try:
-                download(job["url"], rung, dest, job["codec"], opts)
-            except yt_dlp.utils.DownloadError as exc:
-                print(f"    download failed: {exc}")
+            # A 403 here is YouTube rate-limiting, not a permanent failure.
+            for attempt in range(1, args.download_retries + 1):
+                try:
+                    download(job["url"], rung, dest, job["codec"], opts)
+                    exc = None
+                    break
+                except yt_dlp.utils.DownloadError as err:
+                    exc = err
+                    if attempt < args.download_retries:
+                        backoff = 30 * attempt
+                        print(f"    attempt {attempt} failed, retrying in "
+                              f"{backoff}s: {str(err)[:90]}")
+                        time.sleep(backoff)
+            if exc is not None:
+                print(f"    download failed after {args.download_retries} "
+                      f"attempts: {exc}")
                 e.update(status="failed", error=str(exc))
                 failed += 1
                 state.save()
@@ -388,6 +406,8 @@ def main(argv=None) -> int:
                     except HttpError as exc:
                         print(f"    could not delete: {exc}")
             state.save()
+            if pending or ready[-1] is not job:
+                time.sleep(args.pause)
 
         if not pending:
             break

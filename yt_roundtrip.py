@@ -237,6 +237,12 @@ def download(url: str, rung: int, dest: Path, codec: str, opts: dict) -> None:
         "outtmpl": str(dest.parent / dest.stem) + ".%(ext)s",
         "progress_hooks": [hook],
         "overwrites": True,
+        # YouTube throttles back-to-back downloads with 403s; back off and retry.
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 5,
+        "retry_sleep_functions": {"http": lambda n: min(5 * 2 ** n, 120)},
+        "sleep_interval_requests": 1,
     }
     if codec in sort:
         ydl_opts["format_sort"] = sort[codec]
