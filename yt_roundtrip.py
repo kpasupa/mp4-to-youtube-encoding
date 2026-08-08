@@ -32,7 +32,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
@@ -50,18 +50,24 @@ RETRIABLE_STATUS = {500, 502, 503, 504}
 def probe_height(path: Path) -> int:
     """Display height of the first video stream, accounting for rotation."""
     out = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height:stream_side_data=rotation",
-            "-of", "json", str(path),
-        ],
-        capture_output=True, text=True, check=True,
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_streams", "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", check=True,
     ).stdout
-    stream = json.loads(out)["streams"][0]
+    streams = json.loads(out).get("streams") or []
+    if not streams:
+        raise ValueError("no video stream")
+    stream = streams[0]
     w, h = int(stream["width"]), int(stream["height"])
+
+    rotation = 0
     for sd in stream.get("side_data_list", []):
-        if abs(int(sd.get("rotation", 0))) % 180 == 90:
-            w, h = h, w
+        if "rotation" in sd:
+            rotation = int(float(sd["rotation"]))
+    if not rotation:
+        rotation = int(float(stream.get("tags", {}).get("rotate", 0) or 0))
+    if abs(rotation) % 180 == 90:
+        w, h = h, w
     return h
 
 
@@ -274,6 +280,11 @@ def parse_args(argv=None):
 
 
 def main(argv=None) -> int:
+    # Source trees often contain non-ASCII names; don't die printing them.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     args = parse_args(argv)
     if not args.source.is_dir():
         sys.exit(f"source is not a folder: {args.source}")
@@ -317,7 +328,8 @@ def main(argv=None) -> int:
         print(f"[{i}/{len(files)}] {key}")
         try:
             height = probe_height(path)
-        except (subprocess.CalledProcessError, KeyError, IndexError) as exc:
+        except (subprocess.CalledProcessError, KeyError, IndexError,
+                ValueError, json.JSONDecodeError, FileNotFoundError) as exc:
             print(f"    ffprobe failed, skipping: {exc}")
             e.update(status="failed", error=f"ffprobe: {exc}")
             state.save()
@@ -387,9 +399,9 @@ def main(argv=None) -> int:
             state.save()
             continue
 
-        e.update(status="done", downloaded_height=best,
-                 size=dest.stat().st_size)
-        print(f"    saved {dest}  ({dest.stat().st_size / 1e6:.1f} MB, {best}p)")
+        got = min(best, rung)
+        e.update(status="done", downloaded_height=got, size=dest.stat().st_size)
+        print(f"    saved {dest}  ({dest.stat().st_size / 1e6:.1f} MB, {got}p)")
         done += 1
 
         if not args.keep_remote:
