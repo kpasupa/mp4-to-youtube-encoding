@@ -40,7 +40,7 @@ from yt_roundtrip import (
     target_rung,
 )
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 STATE_NAME = ".yt_pullback_state.json"
 # YouTube Data API v3 costs.
@@ -197,10 +197,10 @@ def parse_args(argv=None):
     p.add_argument("--since", default="2026-07-21",
                    help="ignore videos published before this date (YYYY-MM-DD)")
     p.add_argument("--ext", default=".mp4", help="comma-separated source extensions")
-    p.add_argument("--codec", choices=["any", "av1", "vp9", "h264"], default="vp9",
-                   help="wait for this codec at source resolution before "
-                        "downloading; 'any' takes the first rendition, which is "
-                        "H.264 and roughly twice the size")
+    p.add_argument("--codec", choices=["any", "av1", "vp9", "h264"], default="any",
+                   help="'any' downloads as soon as the source resolution is "
+                        "available; naming a codec waits for that codec too, "
+                        "which yields smaller files but can take hours")
     p.add_argument("--codec-wait", type=int, default=21600,
                    help="seconds to wait for --codec before settling for H.264")
     p.add_argument("--keep-remote", action="store_true",
@@ -322,8 +322,9 @@ def main(argv=None) -> int:
     state.save()
 
     # ---- take whatever is ready, cycle, don't let one slow transcode block --- #
-    print(f"\n{len(pending)} to fetch; waiting for a {args.codec} rendition "
-          f"at source resolution\n")
+    goal = ("source resolution" if args.codec == "any"
+            else f"a {args.codec} rendition at source resolution")
+    print(f"\n{len(pending)} to fetch; waiting for {goal}\n")
     start = time.time()
     settled_warned = False
     # Never give up before the codec deadline, or the two flags fight.
