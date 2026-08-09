@@ -27,9 +27,12 @@ from pathlib import Path
 
 from yt_roundtrip import State
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
 
 STATE_NAME = ".local_encode_state.json"
+# Low-bitrate sources inflate at the normal crf; measured on a 0.2 Mbps wmv,
+# crf26 gave 110% of source while crf30 gave 96%.
+LOW_CRF_BUMP = 4
 
 # crf defaults chosen from the VMAF head-to-head against YouTube's renditions.
 CODECS = {
@@ -107,6 +110,9 @@ def parse_args(argv=None):
                    help="quality, lower is better (default depends on --codec)")
     p.add_argument("--min-bitrate", type=float, default=1.5,
                    help="Mbps below which a file is copied instead of encoded")
+    p.add_argument("--force-mp4", action="store_true",
+                   help="encode low-bitrate files too, so every output is .mp4; "
+                        f"they use crf+{LOW_CRF_BUMP} to avoid inflating them")
     p.add_argument("--ext", default=".mp4,.wmv,.mov,.avi,.mkv")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--version", action="version", version=__version__)
@@ -131,24 +137,53 @@ def main(argv=None) -> int:
         sys.exit(f"no video files under {args.source}")
 
     state = State(args.output / STATE_NAME)
-    print(f"{len(files)} file(s), {args.codec} crf{crf}, "
-          f"copy below {args.min_bitrate} Mbps\n")
 
-    done = copied = failed = skipped = 0
+    def previous_output(rel: Path, e: dict) -> Path:
+        """Where an earlier run put this file."""
+        if e.get("output"):
+            return args.output / e["output"]
+        # Entries written before --force-mp4 existed recorded no path.
+        return args.output / (rel if e.get("status") == "copied"
+                              else rel.with_suffix(".mp4"))
+
+    # Decide the work list up front so the counts mean something. Skipping is
+    # driven by this tool's own state, not by a file merely existing - output
+    # left behind by something else is meant to be replaced.
+    todo, already, already_bytes = [], 0, 0
+    for src in files:
+        rel = src.relative_to(args.source)
+        e = state.entry(rel.as_posix())
+        status = e.get("status")
+        # --force-mp4 changes what "copied" should have produced, so redo those.
+        superseded = status == "copied" and args.force_mp4
+        if status in ("done", "copied") and not superseded:
+            prev = previous_output(rel, e)
+            if prev.exists():
+                already += 1
+                already_bytes += prev.stat().st_size
+                continue
+        todo.append(src)
+
+    policy = (f"everything to .mp4 (low bitrate at crf{crf + LOW_CRF_BUMP})"
+              if args.force_mp4 else f"copy below {args.min_bitrate} Mbps")
+    print(f"{len(files)} file(s): {already} already done, {len(todo)} to process")
+    print(f"{args.codec} crf{crf}, {policy}\n")
+
+    done = copied = failed = 0
+    skipped = already
     src_total = out_total = 0
     started = time.time()
 
-    for n, src in enumerate(files, 1):
+    for n, src in enumerate(todo, 1):
         rel = src.relative_to(args.source)
         key = rel.as_posix()
         e = state.entry(key)
         size = src.stat().st_size
 
-        # Copies keep their container; encodes always land as .mp4.
         try:
             info = probe(src)
         except Exception as exc:
-            print(f"[{n}/{len(files)}] {key}\n    probe failed: {exc}")
+            print(f"[{n}/{len(todo)}] {key}\n    probe failed: {exc}")
             e.update(status="failed", error=str(exc)[:200])
             failed += 1
             state.save()
@@ -156,22 +191,26 @@ def main(argv=None) -> int:
 
         mbps = size * 8 / info["duration"] / 1e6 if info["duration"] else 0
         low = mbps < args.min_bitrate
-        dst = args.output / (rel if low else rel.with_suffix(".mp4"))
+        # Copies keep their container; everything else lands as .mp4.
+        copy_it = low and not args.force_mp4
+        dst = args.output / (rel if copy_it else rel.with_suffix(".mp4"))
+        use_crf = crf + LOW_CRF_BUMP if low else crf
 
-        if e.get("status") in ("done", "copied") and dst.exists():
-            src_total += size
-            out_total += dst.stat().st_size
-            skipped += 1
-            continue
-
-        print(f"[{n}/{len(files)}] {key}")
+        print(f"[{n}/{len(todo)}] {key}   ({len(todo) - n} left)")
         print(f"    {size/1e6:.0f} MB, {info['height']}p, {mbps:.1f} Mbps")
 
         if args.dry_run:
-            print(f"    would {'copy' if low else 'encode'} -> {dst.name}")
+            print(f"    would {'copy' if copy_it else f'encode crf{use_crf}'}"
+                  f" -> {dst.name}")
             continue
 
-        if low:
+        # Whatever an earlier run left at a different path is now superseded.
+        stale = previous_output(rel, e)
+        if stale != dst and stale.exists():
+            print(f"    removing superseded {stale.name}")
+            stale.unlink()
+
+        if copy_it:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             # A copy keeps its own container, so an .mp4 left at this path by an
@@ -180,13 +219,14 @@ def main(argv=None) -> int:
                 if old != dst and old.suffix.lower() == ".mp4":
                     print(f"    removing superseded {old.name}")
                     old.unlink()
-            e.update(status="copied", size=dst.stat().st_size, mbps=round(mbps, 2))
+            e.update(status="copied", size=dst.stat().st_size, mbps=round(mbps, 2),
+                     output=dst.relative_to(args.output).as_posix())
             print(f"    copied as-is (below {args.min_bitrate} Mbps)")
             copied += 1
         else:
             t0 = time.time()
             try:
-                encode(src, dst, args.codec, crf, info["duration"])
+                encode(src, dst, args.codec, use_crf, info["duration"])
             except Exception as exc:
                 print(f"    encode failed: {exc}")
                 e.update(status="failed", error=str(exc)[:200])
@@ -208,7 +248,8 @@ def main(argv=None) -> int:
 
             out = dst.stat().st_size
             e.update(status="done", size=out, mbps=round(mbps, 2),
-                     ratio=round(out / size, 3))
+                     ratio=round(out / size, 3), crf=use_crf,
+                     output=dst.relative_to(args.output).as_posix())
             print(f"    {size/1e6:.0f} -> {out/1e6:.0f} MB  "
                   f"({out/size*100:.1f}%)  in {time.time()-t0:.0f}s")
             done += 1

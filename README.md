@@ -192,6 +192,7 @@ rerun the same command and finished files are skipped.
 | `--codec` | `av1` | `av1` (smallest), `h264` (plays anywhere), `h265` (middle) |
 | `--crf` | per codec | Lower is better quality. av1 42, h264 26, h265 28 |
 | `--min-bitrate` | `1.5` | Mbps below which a file is **copied verbatim** rather than encoded |
+| `--force-mp4` | off | Encode low-bitrate files too, so every output is `.mp4` |
 | `--ext` | `.mp4,.wmv,.mov,.avi,.mkv` | Which files to pick up |
 | `--dry-run` | off | List what would happen and exit |
 
@@ -199,6 +200,14 @@ rerun the same command and finished files are skipped.
 and re-encoding makes the file *bigger*. Those files are copied through untouched so your
 output tree stays a complete mirror. This was measured, not guessed - a 0.2 Mbps file put
 through YouTube came back at 188% of its original size.
+
+**Getting a uniformly `.mp4` output.** A copied file keeps its own container, so a
+low-bitrate `.wmv` stays `.wmv`. Pass `--force-mp4` to encode those as well. They are
+encoded at `crf + 4`, because a normal crf inflates an already-heavily-compressed source -
+measured on a 0.2 Mbps wmv, crf26 produced 110% of the original while crf30 produced 96%.
+Expect a small quality drop on these files: they have little margin left, and any
+re-encode costs something. Re-running with `--force-mp4` re-processes anything a previous
+run copied, and deletes the file it supersedes.
 
 Encoding runs at roughly 2x realtime for 1080p AV1 on a typical desktop, so an hour of
 footage takes about half an hour. Every encode is verified against the source duration
