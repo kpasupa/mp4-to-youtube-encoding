@@ -27,7 +27,7 @@ from pathlib import Path
 
 from yt_roundtrip import State
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 STATE_NAME = ".local_encode_state.json"
 
@@ -174,6 +174,12 @@ def main(argv=None) -> int:
         if low:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
+            # A copy keeps its own container, so an .mp4 left at this path by an
+            # earlier run would linger next to it as a confusing duplicate.
+            for old in dst.parent.glob(dst.stem + ".*"):
+                if old != dst and old.suffix.lower() == ".mp4":
+                    print(f"    removing superseded {old.name}")
+                    old.unlink()
             e.update(status="copied", size=dst.stat().st_size, mbps=round(mbps, 2))
             print(f"    copied as-is (below {args.min_bitrate} Mbps)")
             copied += 1
