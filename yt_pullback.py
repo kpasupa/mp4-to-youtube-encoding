@@ -40,7 +40,7 @@ from yt_roundtrip import (
     target_rung,
 )
 
-__version__ = "1.1.5"
+__version__ = "1.1.6"
 
 STATE_NAME = ".yt_pullback_state.json"
 # YouTube Data API v3 costs.
@@ -333,8 +333,10 @@ def main(argv=None) -> int:
     print(f"\n{len(pending)} to fetch; waiting for {goal}\n")
     start = time.time()
     settled_warned = False
-    # Never give up before the codec deadline, or the two flags fight.
-    deadline = start + max(args.wait_timeout, args.codec_wait)
+    # Only stretch past --wait-timeout when actually holding out for a codec.
+    limit = (max(args.wait_timeout, args.codec_wait) if args.codec != "any"
+             else args.wait_timeout)
+    deadline = start + limit
     while pending:
         # Past the codec deadline, take H.264 rather than lose the upload.
         settle = time.time() > start + args.codec_wait
@@ -412,7 +414,7 @@ def main(argv=None) -> int:
         if not pending:
             break
         if time.time() > deadline:
-            print(f"\nstill transcoding after {args.wait_timeout}s, left for a rerun:")
+            print(f"\nstill transcoding after {limit}s, left for a rerun:")
             for job in pending:
                 print(f"     {job['best']}p / need {job['rung']}p  {job['rel']}")
             break
