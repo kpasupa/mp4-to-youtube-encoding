@@ -145,7 +145,72 @@ re-authenticate whenever it expires.
 
 ---
 
-## Two ways to run this
+## Which approach should you use?
+
+Measured head-to-head against YouTube's own encoder, on 60-second slices scored with
+VMAF (Netflix's perceptual quality metric, 0-100, where a gap under ~1 point is invisible):
+
+**1080p source, 6.7 Mbps:**
+
+| Encoder | 60s size | VMAF |
+|---|---:|---:|
+| YouTube | 19.9 MB | 92.35 |
+| local x264 crf26 | 13.5 MB | 92.74 |
+| local av1 crf38 | 11.4 MB | 93.55 |
+| **local av1 crf42** | **8.8 MB** | 92.70 |
+
+**720p source, 2.7 Mbps:**
+
+| Encoder | 60s size | VMAF |
+|---|---:|---:|
+| YouTube | 2.2 MB | 97.05 |
+| **local x264 crf23** | **1.5 MB** | 96.82 |
+
+Local encoding wins on both, and by a wide margin at 1080p — **56% smaller at slightly
+better measured quality**. It also avoids the daily upload cap, the bot-check that blocks
+downloads after sustained use, copyright rejections on legitimate content, and the fact
+that low-bitrate files come back from YouTube *larger* than they went in.
+
+**Use `local_encode.py` unless you specifically want YouTube's encoder.** The YouTube
+scripts remain here and work, but the round trip costs days of uploading to produce a
+bigger file.
+
+---
+
+## Usage - local encoding (`local_encode.py`)
+
+```bash
+python local_encode.py "E:\source folder" "E:\output folder"
+```
+
+Walks the tree, encodes each video, and writes it to the mirrored path. Defaults to AV1
+at CRF 42. Progress lives in `OUTPUT/.local_encode_state.json`, so it is resumable -
+rerun the same command and finished files are skipped.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--codec` | `av1` | `av1` (smallest), `h264` (plays anywhere), `h265` (middle) |
+| `--crf` | per codec | Lower is better quality. av1 42, h264 26, h265 28 |
+| `--min-bitrate` | `1.5` | Mbps below which a file is **copied verbatim** rather than encoded |
+| `--ext` | `.mp4,.wmv,.mov,.avi,.mkv` | Which files to pick up |
+| `--dry-run` | off | List what would happen and exit |
+
+**Why `--min-bitrate` matters.** Below roughly 1.5 Mbps there is nothing left to remove,
+and re-encoding makes the file *bigger*. Those files are copied through untouched so your
+output tree stays a complete mirror. This was measured, not guessed - a 0.2 Mbps file put
+through YouTube came back at 188% of its original size.
+
+Encoding runs at roughly 2x realtime for 1080p AV1 on a typical desktop, so an hour of
+footage takes about half an hour. Every encode is verified against the source duration
+before being marked done, so a truncated or failed encode is reported rather than silently
+accepted.
+
+Choose `--codec h264` if the output is going to other people - AV1 needs a recent player,
+while H.264 plays on anything, and even at CRF 26 it still beats YouTube by ~32%.
+
+---
+
+## Two ways to run it through YouTube
 
 **`yt_pullback.py` — drag-and-drop (recommended for large libraries).** You upload
 through the YouTube Studio web UI yourself, then this script pulls everything back down
