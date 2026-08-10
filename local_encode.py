@@ -27,7 +27,7 @@ from pathlib import Path
 
 from yt_roundtrip import State
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 STATE_NAME = ".local_encode_state.json"
 # Low-bitrate sources inflate at the normal crf; measured on a 0.2 Mbps wmv,
@@ -84,13 +84,19 @@ def encode(src: Path, dst: Path, codec: str, crf: int, duration: float) -> None:
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace")
-    for line in proc.stdout:
-        if line.startswith("out_time_ms=") and duration:
-            try:
-                pct = int(line.split("=")[1]) / 1e6 / duration * 100
-            except (ValueError, ZeroDivisionError):
-                continue
-            print(f"\r    encoding {min(pct, 100):5.1f}%", end="", flush=True)
+    try:
+        for line in proc.stdout:
+            if line.startswith("out_time_ms=") and duration:
+                try:
+                    pct = int(line.split("=")[1]) / 1e6 / duration * 100
+                except (ValueError, ZeroDivisionError):
+                    continue
+                print(f"\r    encoding {min(pct, 100):5.1f}%", end="", flush=True)
+    except KeyboardInterrupt:
+        # Don't leave ffmpeg running once we stop reading its progress.
+        proc.kill()
+        proc.wait()
+        raise
     err = proc.stderr.read()
     if proc.wait() != 0:
         raise RuntimeError(err.strip()[:300] or "ffmpeg failed")
@@ -268,4 +274,9 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        # The file in flight has no state entry, so a rerun simply redoes it.
+        print("\n\nstopped. rerun the same command to resume where this left off.")
+        sys.exit(130)
