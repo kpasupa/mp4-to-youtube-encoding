@@ -22,17 +22,21 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 from yt_roundtrip import State
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 STATE_NAME = ".local_encode_state.json"
 # Low-bitrate sources inflate at the normal crf; measured on a 0.2 Mbps wmv,
 # crf26 gave 110% of source while crf30 gave 96%.
 LOW_CRF_BUMP = 4
+# ffmpeg emits a progress block roughly every half second; if several minutes of
+# them carry no advancing timestamp, the encode is wedged rather than slow.
+STALL = 600
 
 # crf defaults chosen from the VMAF head-to-head against YouTube's renditions.
 CODECS = {
@@ -82,24 +86,38 @@ def encode(src: Path, dst: Path, codec: str, crf: int, duration: float) -> None:
         *spec["args"], "-crf", str(crf), "-pix_fmt", "yuv420p",
         *spec["audio"], "-movflags", "+faststart", str(dst),
     ]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace")
-    try:
-        for line in proc.stdout:
-            if line.startswith("out_time_ms=") and duration:
-                try:
-                    pct = int(line.split("=")[1]) / 1e6 / duration * 100
-                except (ValueError, ZeroDivisionError):
-                    continue
-                print(f"\r    encoding {min(pct, 100):5.1f}%", end="", flush=True)
-    except KeyboardInterrupt:
-        # Don't leave ffmpeg running once we stop reading its progress.
-        proc.kill()
-        proc.wait()
-        raise
-    err = proc.stderr.read()
-    if proc.wait() != 0:
-        raise RuntimeError(err.strip()[:300] or "ffmpeg failed")
+    # stderr goes to a file, never a pipe: we only drain stdout, and a damaged
+    # source can emit enough decode warnings to fill a pipe buffer, at which
+    # point ffmpeg blocks writing to it and the whole thing deadlocks.
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8",
+                                errors="replace") as errfile:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errfile,
+                                text=True, encoding="utf-8", errors="replace")
+        try:
+            last = time.time()
+            for line in proc.stdout:
+                if line.startswith("out_time_ms=") and duration:
+                    try:
+                        pct = int(line.split("=")[1]) / 1e6 / duration * 100
+                    except (ValueError, ZeroDivisionError):
+                        continue
+                    last = time.time()
+                    print(f"\r    encoding {min(pct, 100):5.1f}%", end="",
+                          flush=True)
+                elif line.startswith("progress=") and time.time() - last > STALL:
+                    proc.kill()
+                    proc.wait()
+                    raise RuntimeError(f"no progress for {STALL}s, gave up")
+        except KeyboardInterrupt:
+            # Don't leave ffmpeg running once we stop reading its progress.
+            proc.kill()
+            proc.wait()
+            raise
+        code = proc.wait()
+        errfile.seek(0)
+        err = errfile.read()
+    if code != 0:
+        raise RuntimeError(err.strip()[-300:] or f"ffmpeg exited {code}")
     print("\r    encoding 100.0%")
 
 
