@@ -28,9 +28,10 @@ from pathlib import Path
 
 from yt_roundtrip import State
 
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 STATE_NAME = ".local_encode_state.json"
+NEEDS_UPLOAD = "_needs_upload.txt"
 # Low-bitrate sources inflate at the normal crf; measured on a 0.2 Mbps wmv,
 # crf26 gave 110% of source while crf30 gave 96%.
 LOW_CRF_BUMP = 4
@@ -134,6 +135,8 @@ def parse_args(argv=None):
                    help="quality, lower is better (default depends on --codec)")
     p.add_argument("--min-bitrate", type=float, default=1.5,
                    help="Mbps below which a file is copied instead of encoded")
+    p.add_argument("--retry-damaged", action="store_true",
+                   help="re-attempt sources previously found to be truncated")
     p.add_argument("--force-mp4", action="store_true",
                    help="encode low-bitrate files too, so every output is .mp4; "
                         f"they use crf+{LOW_CRF_BUMP} to avoid inflating them")
@@ -174,10 +177,16 @@ def main(argv=None) -> int:
     # driven by this tool's own state, not by a file merely existing - output
     # left behind by something else is meant to be replaced.
     todo, already, already_bytes = [], 0, 0
+    known_damaged = []
     for src in files:
         rel = src.relative_to(args.source)
         e = state.entry(rel.as_posix())
         status = e.get("status")
+        # A damaged source will fail identically every run, so leave it alone
+        # unless explicitly asked to try again.
+        if status == "damaged" and not args.retry_damaged:
+            known_damaged.append(rel)
+            continue
         # --force-mp4 changes what "copied" should have produced, so redo those.
         superseded = status == "copied" and args.force_mp4
         if status in ("done", "copied") and not superseded:
@@ -190,9 +199,11 @@ def main(argv=None) -> int:
 
     policy = (f"everything to .mp4 (low bitrate at crf{crf + LOW_CRF_BUMP})"
               if args.force_mp4 else f"copy below {args.min_bitrate} Mbps")
-    print(f"{len(files)} file(s): {already} already done, {len(todo)} to process")
+    print(f"{len(files)} file(s): {already} already done, {len(todo)} to process"
+          + (f", {len(known_damaged)} damaged (skipped)" if known_damaged else ""))
     print(f"{args.codec} crf{crf}, {policy}\n")
 
+    damaged = []
     done = copied = failed = 0
     skipped = already
     src_total = out_total = 0
@@ -258,15 +269,20 @@ def main(argv=None) -> int:
                 state.save()
                 continue
 
-            # A truncated encode is the failure mode that matters here.
+            # ffmpeg can exit cleanly having encoded only part of a source whose
+            # data runs out partway. Half a video is worse than none: drop it,
+            # record why, and don't attempt it again on later runs.
             try:
                 got = probe(dst)["duration"]
             except Exception:
                 got = 0
             if abs(got - info["duration"]) > 2:
-                print(f"    TRUNCATED: {got:.0f}s vs source {info['duration']:.0f}s")
-                e.update(status="failed", error="duration mismatch")
-                failed += 1
+                print(f"    DAMAGED SOURCE: only {got:.0f}s of "
+                      f"{info['duration']:.0f}s is readable - skipping")
+                dst.unlink(missing_ok=True)
+                e.update(status="damaged", readable=round(got, 1),
+                         expected=round(info["duration"], 1))
+                damaged.append((rel, got, info["duration"]))
                 state.save()
                 continue
 
@@ -283,10 +299,35 @@ def main(argv=None) -> int:
         state.save()
 
     state.save()
-    print(f"\nencoded {done}, copied {copied}, skipped {skipped}, failed {failed}")
+    print(f"\nencoded {done}, copied {copied}, skipped {skipped}, "
+          f"failed {failed}, damaged {len(damaged) + len(known_damaged)}")
     if src_total:
         print(f"{src_total/1e9:.2f} GB -> {out_total/1e9:.2f} GB "
               f"({out_total/src_total*100:.1f}%)")
+    if damaged or known_damaged:
+        print("\ndamaged sources - no output written, source left untouched:")
+        for rel, got, want in damaged:
+            print(f"  {got:.0f}s of {want:.0f}s readable   {rel}")
+        for rel in known_damaged:
+            print(f"  (skipped from an earlier run)          {rel}")
+        print("re-check them with --retry-damaged")
+
+    # Anything without an output is a candidate for the YouTube route, so write
+    # the full source paths somewhere you can open and drag from.
+    stuck = [args.source / rel for rel, _, _ in damaged]
+    stuck += [args.source / rel for rel in known_damaged]
+    stuck += [args.source / Path(k) for k, v in state.data.items()
+              if v.get("status") == "failed"]
+    log = args.output / NEEDS_UPLOAD
+    if stuck:
+        log.write_text(
+            "# Sources with no local output - upload these to YouTube manually,\n"
+            "# then pull them back with yt_pullback.py\n"
+            + "\n".join(str(p) for p in sorted(set(stuck))) + "\n",
+            encoding="utf-8")
+        print(f"\n{len(set(stuck))} file(s) need the YouTube route - listed in\n  {log}")
+    elif log.exists():
+        log.unlink()
     print(f"elapsed {(time.time()-started)/60:.0f} min")
     return 1 if failed else 0
 
