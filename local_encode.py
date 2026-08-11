@@ -28,7 +28,7 @@ from pathlib import Path
 
 from yt_roundtrip import State
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 STATE_NAME = ".local_encode_state.json"
 NEEDS_UPLOAD = "_needs_upload.txt"
@@ -136,7 +136,7 @@ def parse_args(argv=None):
     p.add_argument("--min-bitrate", type=float, default=1.5,
                    help="Mbps below which a file is copied instead of encoded")
     p.add_argument("--retry-damaged", action="store_true",
-                   help="re-attempt sources previously found to be truncated")
+                   help="re-encode sources previously found to be truncated")
     p.add_argument("--force-mp4", action="store_true",
                    help="encode low-bitrate files too, so every output is .mp4; "
                         f"they use crf+{LOW_CRF_BUMP} to avoid inflating them")
@@ -177,33 +177,31 @@ def main(argv=None) -> int:
     # driven by this tool's own state, not by a file merely existing - output
     # left behind by something else is meant to be replaced.
     todo, already, already_bytes = [], 0, 0
-    known_damaged = []
+    known_partial = []
     for src in files:
         rel = src.relative_to(args.source)
         e = state.entry(rel.as_posix())
         status = e.get("status")
-        # A damaged source will fail identically every run, so leave it alone
-        # unless explicitly asked to try again.
-        if status == "damaged" and not args.retry_damaged:
-            known_damaged.append(rel)
-            continue
         # --force-mp4 changes what "copied" should have produced, so redo those.
         superseded = status == "copied" and args.force_mp4
-        if status in ("done", "copied") and not superseded:
+        # A truncated source reads the same every run; only redo on request.
+        retry = status == "partial" and args.retry_damaged
+        if status in ("done", "copied", "partial") and not superseded and not retry:
             prev = previous_output(rel, e)
             if prev.exists():
                 already += 1
                 already_bytes += prev.stat().st_size
+                if status == "partial":
+                    known_partial.append((rel, e.get("readable"), e.get("expected")))
                 continue
         todo.append(src)
 
     policy = (f"everything to .mp4 (low bitrate at crf{crf + LOW_CRF_BUMP})"
               if args.force_mp4 else f"copy below {args.min_bitrate} Mbps")
-    print(f"{len(files)} file(s): {already} already done, {len(todo)} to process"
-          + (f", {len(known_damaged)} damaged (skipped)" if known_damaged else ""))
+    print(f"{len(files)} file(s): {already} already done, {len(todo)} to process")
     print(f"{args.codec} crf{crf}, {policy}\n")
 
-    damaged = []
+    partial = []
     done = copied = failed = 0
     skipped = already
     src_total = out_total = 0
@@ -277,12 +275,21 @@ def main(argv=None) -> int:
             except Exception:
                 got = 0
             if abs(got - info["duration"]) > 2:
-                print(f"    DAMAGED SOURCE: only {got:.0f}s of "
-                      f"{info['duration']:.0f}s is readable - skipping")
-                dst.unlink(missing_ok=True)
-                e.update(status="damaged", readable=round(got, 1),
-                         expected=round(info["duration"], 1))
-                damaged.append((rel, got, info["duration"]))
+                # Keep what exists rather than discarding it. Measured on a real
+                # zero-filled source: the partial local encode scored VMAF 92.4
+                # against 89.9 for the same file routed through YouTube, which
+                # reads no further either. There is no better copy to be had.
+                out = dst.stat().st_size
+                print(f"    PARTIAL: only {got:.0f}s of {info['duration']:.0f}s "
+                      f"is readable - kept {out/1e6:.0f} MB")
+                e.update(status="partial", size=out, crf=use_crf,
+                         ratio=round(out / size, 3),
+                         readable=round(got, 1),
+                         expected=round(info["duration"], 1),
+                         output=dst.relative_to(args.output).as_posix())
+                partial.append((rel, got, info["duration"]))
+                src_total += size
+                out_total += out
                 state.save()
                 continue
 
@@ -300,24 +307,21 @@ def main(argv=None) -> int:
 
     state.save()
     print(f"\nencoded {done}, copied {copied}, skipped {skipped}, "
-          f"failed {failed}, damaged {len(damaged) + len(known_damaged)}")
+          f"failed {failed}, partial {len(partial) + len(known_partial)}")
     if src_total:
         print(f"{src_total/1e9:.2f} GB -> {out_total/1e9:.2f} GB "
               f"({out_total/src_total*100:.1f}%)")
-    if damaged or known_damaged:
-        print("\ndamaged sources - no output written, source left untouched:")
-        for rel, got, want in damaged:
-            print(f"  {got:.0f}s of {want:.0f}s readable   {rel}")
-        for rel in known_damaged:
-            print(f"  (skipped from an earlier run)          {rel}")
-        print("re-check them with --retry-damaged")
+    if partial or known_partial:
+        print("\npartial - source data runs out early, encoded what exists:")
+        for rel, got, want in partial:
+            print(f"  {got:.0f}s of {want:.0f}s   {rel}")
+        for rel, got, want in known_partial:
+            print(f"  {got or 0:.0f}s of {want or 0:.0f}s   {rel}  (earlier run)")
+        print("these are as complete as the sources allow; --retry-damaged redoes them")
 
-    # Anything without an output is a candidate for the YouTube route, so write
-    # the full source paths somewhere you can open and drag from.
-    stuck = [args.source / rel for rel, _, _ in damaged]
-    stuck += [args.source / rel for rel in known_damaged]
-    stuck += [args.source / Path(k) for k, v in state.data.items()
-              if v.get("status") == "failed"]
+    # Only files with no output at all are candidates for the YouTube route.
+    stuck = [args.source / Path(k) for k, v in state.data.items()
+             if v.get("status") == "failed"]
     log = args.output / NEEDS_UPLOAD
     if stuck:
         log.write_text(
